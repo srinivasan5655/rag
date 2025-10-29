@@ -179,3 +179,144 @@ def run_prompt_array(prompt_list: List[str],
     )
 
     return transcript
+
+
+
+def build_faiss_index(
+    chunks: List[Dict[str, Any]],
+    index_path: str,
+    use_checkpoint: bool = True,
+    supporting_docs: Optional[List[Dict[str, Any]]] = None
+) -> Tuple[faiss.Index, List[Dict[str, Any]]]:
+    """
+    Build FAISS index from chunks and optional supporting documents.
+    """
+    print(f"\n{'='*60}")
+    print("🏗️  BUILDING FAISS INDEX (WITH SUPPORT DOCS)" if supporting_docs else "🏗️  BUILDING FAISS INDEX")
+    print(f"{'='*60}")
+    
+    start_time = time.time()
+    
+    # Prepare texts and metadata
+    texts = []
+    metadata = []
+    
+    print(f"📦 Processing {len(chunks)} code chunks...")
+    
+    for chunk in chunks:
+        chunk_text = chunk.get("text", "")
+        if not chunk_text or not chunk_text.strip():
+            continue
+        
+        texts.append(chunk_text)
+        metadata.append({
+            "text": chunk_text,
+            "type": "code_chunk",
+            "path": chunk.get("path", ""),
+            "kind": chunk.get("kind", "code_chunk"),
+            "hash": chunk.get("hash", ""),
+            "metrics": chunk.get("metrics", {})
+        })
+    
+    # Optional: Include supporting docs
+    if supporting_docs:
+        print(f"📚 Including {len(supporting_docs)} supporting documents...")
+        for doc in supporting_docs:
+            text = doc.get("text", "")
+            print(f"text length: {len(text)}")
+            print(f"source: {doc.get('source', '')}")
+            if not text.strip():
+                continue
+            # Split large docs into smaller chunks
+            for piece in sliding_window(text, 1800, 200):
+                if not piece.strip():
+                    continue
+                texts.append(piece)
+                metadata.append({
+                    "text": piece,
+                    "type": "support_doc",
+                    "file_name": doc.get("source", ""),
+                    "file_path": doc.get("file_path", ""),
+                    "ext": doc.get("ext", ""),
+                    "hash": doc.get("hash", ""),
+                    "kind": "support_doc"
+                })
+    
+    if not texts:
+        raise ValueError("No valid chunks or documents to index!")
+    
+    print(f"✅ {len(texts)} total text segments prepared for embedding")
+    
+    # Generate embeddings (with checkpoint support)
+    checkpoint_path = None
+    if use_checkpoint:
+        Path(CHECKPOINT_DIR).mkdir(parents=True, exist_ok=True)
+        checkpoint_path = os.path.join(CHECKPOINT_DIR, "build_checkpoint.pkl")
+    
+    try:
+        print(f"\n📊 Generating embeddings for {len(texts)} texts...")
+        embeddings = _embed_texts_with_retry(texts, checkpoint_path=checkpoint_path)
+        
+        if len(embeddings) == 0:
+            raise ValueError("No embeddings generated!")
+        
+        if checkpoint_path:
+            _clear_checkpoint(checkpoint_path)
+            
+    except Exception as e:
+        print(f"\n❌ Failed to generate embeddings: {e}")
+        if checkpoint_path and Path(checkpoint_path).exists():
+            print(f"\n💾 Checkpoint saved at: {checkpoint_path}")
+            print("💡 Run the index build again to resume from checkpoint.")
+        raise
+    
+    # Create FAISS index
+    print(f"\n🔍 Creating FAISS index...")
+    dim = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dim)
+    index.add(embeddings.astype('float32'))
+    
+    # Save index + metadata
+    print(f"💾 Saving index to {index_path}...")
+    Path(index_path).parent.mkdir(parents=True, exist_ok=True)
+    faiss.write_index(index, index_path)
+    
+    meta_path = index_path.replace(".faiss", ".meta.pkl")
+    print(f"💾 Saving metadata to {meta_path}...")
+    with open(meta_path, "wb") as f:
+        pickle.dump(metadata, f)
+    
+    total_time = time.time() - start_time
+    print(f"\n{'='*60}")
+    print(f"✅ INDEX BUILD COMPLETE")
+    print(f"{'='*60}")
+    print(f"   📊 Total vectors: {index.ntotal}")
+    print(f"   📐 Vector dimension: {dim}")
+    print(f"   📝 Metadata entries: {len(metadata)}")
+    print(f"   🕒 Total time: {total_time:.2f} seconds")
+    print(f"{'='*60}\n")
+
+    print(f"🔎 Verifying FAISS index and metadata alignment...")
+
+    if index.ntotal != len(metadata):
+        print(f"⚠️  Mismatch detected! FAISS vectors: {index.ntotal}, Metadata entries: {len(metadata)}")
+    else:
+        print(f"✅ FAISS vectors ({index.ntotal}) perfectly match metadata entries.")
+
+    # Confirm metadata file exists and is readable
+    if not Path(meta_path).exists():
+        print(f"❌ Metadata file not found at {meta_path}")
+    else:
+        try:
+            with open(meta_path, "rb") as f:
+                loaded_meta = pickle.load(f)
+            if len(loaded_meta) == len(metadata):
+                print(f"✅ Metadata file successfully verified ({len(loaded_meta)} entries)")
+            else:
+                print(f"⚠️ Metadata file entry count mismatch ({len(loaded_meta)} vs {len(metadata)})")
+        except Exception as e:
+            print(f"❌ Failed to read metadata file: {e}")
+        
+        return index, metadata
+
+
