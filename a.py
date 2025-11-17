@@ -301,3 +301,168 @@ def generate_dot(retrieved: List[Dict[str, Any]],
         return f'digraph G {{ label="Error generating ER: {msg}" }}'
 
 
+
+def parse_create_table_block(create_block: str) -> Dict[str, Any]:
+    """
+    Parse a single CREATE TABLE(...) SQL block and extract:
+     - table_name
+     - schema
+     - columns: list of {name, sql_type, required, is_primary_key, references (dict or None), ref_cols}
+     - table_level_foreign_keys: list of {columns: [...], ref_table: 'X', ref_schema: 'dbo', ref_columns: [...]}
+    """
+
+    result = {
+        "table_name": None,
+        "schema": "dbo",
+        "columns": [],
+        "table_level_foreign_keys": []
+    }
+
+    # Normalize whitespace for easier regex handling
+    sb = create_block.strip()
+
+    # Find table name + optional schema: supports forms like schema.table or [schema].[table] or table
+    mname = re.search(
+        r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:(?:\[\s*([A-Za-z0-9_]+)\s*\])|([A-Za-z0-9_]+))?(?:\s*\.\s*)?(?:\[\s*([A-Za-z0-9_]+)\s*\]|([A-Za-z0-9_]+))',
+        sb, re.IGNORECASE
+    )
+
+    if mname:
+        # groups: maybe schema in group1 or group2; table in group3 or group4
+        schema = mname.group(1) or mname.group(2)
+        table = mname.group(3) or mname.group(4)
+        if table:
+            result['table_name'] = table
+        if schema:
+            result['schema'] = schema
+
+    # Extract everything inside first pair of parentheses after CREATE TABLE
+    body_match = re.search(r'CREATE\s+TABLE[^\(]*\((.*)\)\s*;?', sb, re.IGNORECASE | re.DOTALL)
+    if not body_match:
+        return result
+    body = body_match.group(1).strip()
+
+    # Split top-level comma separated pieces without breaking inside parentheses
+    parts = []
+    cur = ''
+    depth = 0
+    for ch in body:
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            if depth > 0:
+                depth -= 1
+        if ch == ',' and depth == 0:
+            if cur.strip():
+                parts.append(cur.strip())
+            cur = ''
+        else:
+            cur += ch
+    if cur.strip():
+        parts.append(cur.strip())
+
+    # Parse parts: columns vs table-level constraints (PRIMARY KEY / FOREIGN KEY / CONSTRAINT)
+    for part in parts:
+        p = part.strip()
+        if not p:
+            continue
+
+        # Table-level PRIMARY KEY or FOREIGN KEY (skip column parsing here)
+        if re.match(r'^(CONSTRAINT|PRIMARY\s+KEY|FOREIGN\s+KEY|UNIQUE|CHECK)\b', p, re.IGNORECASE):
+            # process in second pass for foreign keys / PKs
+            continue
+
+        # Column definition: [name] type ... (remainder may contain NOT NULL, PRIMARY KEY, REFERENCES)
+        col_m = re.match(r'^(?:\[\s*([A-Za-z0-9_]+)\s*\]|([A-Za-z0-9_]+))\s+(.+)$', p, re.IGNORECASE | re.DOTALL)
+        if not col_m:
+            # fallback: store raw fragment as a column-like entry
+            tokens = p.split()
+            if tokens:
+                result['columns'].append({
+                    'name': tokens[0].strip('[]`"'),
+                    'sql_type': ' '.join(tokens[1:]) if len(tokens) > 1 else '',
+                    'required': 'NOT NULL' in p.upper(),
+                    'is_primary_key': 'PRIMARY KEY' in p.upper(),
+                    'references': None,
+                    'ref_cols': []
+                })
+            continue
+
+        col_name = col_m.group(1) or col_m.group(2)
+        rest = col_m.group(3).strip()
+        rest_upper = rest.upper()
+
+        is_required = 'NOT NULL' in rest_upper
+        is_pk = 'PRIMARY KEY' in rest_upper
+
+        # inline REFERENCES?
+        inline_ref = None
+        inline_ref_cols = []
+        ref_inline_m = re.search(
+            r'REFERENCES\s+(?:\[\s*([A-Za-z0-9_]+)\s*\]\s*\.\s*)?(?:\[\s*([A-Za-z0-9_]+)\s*\]|([A-Za-z0-9_]+))\s*(?:\(\s*([^\)]+)\s*\))?',
+            rest, re.IGNORECASE
+        )
+        if ref_inline_m:
+            # ref_inline_m groups: maybe schema, table, alt_table, refcols
+            ref_schema = ref_inline_m.group(1) or ''
+            ref_table = ref_inline_m.group(2) or ref_inline_m.group(3) or ''
+            refcols_raw = ref_inline_m.group(4) or ''
+            inline_ref = {
+                'schema': ref_schema or result['schema'],
+                'table': ref_table,
+                'column': None
+            }
+            if refcols_raw:
+                inline_ref_cols = [c.strip().strip('[]`"') for c in refcols_raw.split(',')]
+
+        result['columns'].append({
+            'name': col_name,
+            'sql_type': re.split(r'\s+', rest, maxsplit=1)[0] if rest else '',
+            'required': is_required,
+            'is_primary_key': is_pk,
+            'references': inline_ref,
+            'ref_cols': inline_ref_cols
+        })
+
+    # Second pass: find table-level FOREIGN KEY / PRIMARY KEY constraints and attach to columns
+    # e.g. FOREIGN KEY (emp_no) REFERENCES employees (emp_no)
+    for fk_m in re.finditer(
+        r'(?:CONSTRAINT\s+\[?[A-Za-z0-9_]+\]?\s+)?FOREIGN\s+KEY\s*\(\s*([^\)]+)\s*\)\s*REFERENCES\s+(?:\[\s*([A-Za-z0-9_]+)\s*\]\s*\.\s*)?(?:\[\s*([A-Za-z0-9_]+)\s*\]|([A-Za-z0-9_]+))\s*\(\s*([^\)]+)\s*\)',
+        body, re.IGNORECASE):
+        local_cols_raw = fk_m.group(1)
+        ref_schema = fk_m.group(2) or ''
+        ref_table = fk_m.group(3) or fk_m.group(4) or ''
+        ref_cols_raw = fk_m.group(5) or ''
+
+        local_cols = [c.strip().strip('[]`"') for c in re.split(r',\s*', local_cols_raw) if c.strip()]
+        ref_cols = [c.strip().strip('[]`"') for c in re.split(r',\s*', ref_cols_raw) if c.strip()]
+
+        # store table-level fk record
+        result['table_level_foreign_keys'].append({
+            'columns': local_cols,
+            'ref_table': ref_table,
+            'ref_schema': ref_schema or result['schema'],
+            'ref_columns': ref_cols
+        })
+
+        # attach references to individual columns where names match
+        for i, lc in enumerate(local_cols):
+            for col in result['columns']:
+                if col['name'].lower() == lc.lower():
+                    col['references'] = {
+                        'schema': ref_schema or result['schema'],
+                        'table': ref_table,
+                        'column': ref_cols[i] if i < len(ref_cols) else None
+                    }
+
+    # Also capture table-level PRIMARY KEY (if any)
+    pk_m = re.search(r'PRIMARY\s+KEY\s*\(\s*([^\)]+)\s*\)', body, re.IGNORECASE)
+    if pk_m:
+        pk_cols = [c.strip().strip('[]`"') for c in re.split(r',\s*', pk_m.group(1)) if c.strip()]
+        for col in result['columns']:
+            if col['name'] in pk_cols:
+                col['is_primary_key'] = True
+
+    return result
+
+
