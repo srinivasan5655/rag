@@ -545,3 +545,103 @@ def build_faiss_index(
 
     return index, metadata
 
+
+
+
+
+def _process_excel_doc_to_chunks(doc: Dict[str, Any], max_chunk_chars: int = 1800, overlap: int = 200) -> List[Dict[str, Any]]:
+    """
+    Given a supporting_doc entry that represents an Excel file (or contains file bytes),
+    return a list of normalized document chunks (each with 'text' and metadata fields).
+    - doc: dict that may contain 'file_bytes', 'file_path', 'text', 'title', 'source', 'ext'
+    """
+    chunks = []
+    file_name = doc.get("source") or doc.get("title") or doc.get("file_name") or "excel_document"
+    file_ext = (doc.get("ext") or "").lower()
+    # If user already provided flattened text (app.py does df.to_string()), use that as single chunk
+    if doc.get("text") and doc.get("text").strip():
+        chunks.append({
+            "text": doc["text"],
+            "type": "support_doc_text",
+            "title": file_name,
+            "file_name": file_name,
+            "sheet": None,
+            "chunk_id": doc.get("chunk_id", 0)
+        })
+        return chunks
+
+    # Attempt to read from bytes or file_path
+    excel_bytes = None
+    if doc.get("file_bytes"):
+        excel_bytes = doc["file_bytes"]
+    elif doc.get("content_bytes"):
+        excel_bytes = doc["content_bytes"]
+    elif doc.get("file_path") and os.path.exists(doc["file_path"]):
+        with open(doc["file_path"], "rb") as f:
+            excel_bytes = f.read()
+
+    if not excel_bytes:
+        # Nothing more to do, return empty list
+        return chunks
+
+    try:
+        # Read all sheets into dict of DataFrames
+        sheets = pd.read_excel(io.BytesIO(excel_bytes), sheet_name=None)
+    except Exception:
+        # fallback: try engine explicitly or raise
+        try:
+            sheets = pd.read_excel(io.BytesIO(excel_bytes), sheet_name=None, engine="openpyxl")
+        except Exception as e:
+            # can't parse excel
+            print(f"⚠️ Failed to parse excel for {file_name}: {e}")
+            return chunks
+
+    # Convert each sheet to text and chunk it
+    for sheet_name, df in sheets.items():
+        if df is None or df.empty:
+            continue
+
+        # Convert to CSV-like string but truncated if huge
+        try:
+            sheet_text = df.to_csv(index=False)
+        except Exception:
+            # fallback: simple to_string
+            sheet_text = df.to_string(index=False)
+
+        # metadata summary
+        rows, cols = getattr(df, 'shape', (None, None))
+
+        # Use chunk_document_safe if available (preferred)
+        try:
+            from utils import chunk_document_safe
+            sub_chunks = chunk_document_safe(sheet_text, max_tokens=7500)  # maintain parity with app.py
+        except Exception:
+            # fallback sliding window approach in chars
+            def sliding_window_text(text, size=max_chunk_chars, step=None):
+                if step is None:
+                    step = max(1, size - overlap)
+                for i in range(0, max(1, len(text)), step):
+                    yield text[i:i+size]
+                    if i + size >= len(text):
+                        break
+            sub_chunks = list(sliding_window_text(sheet_text, max_chunk_chars, max_chunk_chars - overlap))
+
+        if not sub_chunks:
+            continue
+
+        for i, piece in enumerate(sub_chunks):
+            chunks.append({
+                "text": piece,
+                "type": "support_doc_table",
+                "title": f"{file_name} - {sheet_name} (Part {i+1}/{len(sub_chunks)})",
+                "file_name": file_name,
+                "sheet": sheet_name,
+                "sheet_rows": rows,
+                "sheet_cols": cols,
+                "chunk_id": i
+            })
+
+    return chunks
+
+
+
