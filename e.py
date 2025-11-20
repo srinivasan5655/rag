@@ -1,4 +1,184 @@
 
+def add_documents_to_index(
+    index_path: str,
+    new_docs: List[Dict[str, Any]],
+    use_checkpoint: bool = True
+) -> None:
+    """
+    Add new documents to existing index with validation.
+    Now supports Excel (.xls/.xlsx) supporting docs in the same way
+    as build_faiss_index (per-sheet chunking + rich metadata).
+    """
+    print(f"\n➕ Adding {len(new_docs)} documents to existing index...")
+
+    # Load existing index + metadata
+    index, texts, metadata, _, _ = load_faiss_index(index_path)
+
+    new_texts: List[str] = []
+    new_metadata: List[Dict[str, Any]] = []
+
+    def _sliding_window_text_simple(text: str, size: int = 1800, overlap_chars: int = 200) -> List[str]:
+        step = max(1, size - overlap_chars)
+        out = []
+        for i in range(0, len(text), step):
+            out.append(text[i:i + size])
+            if i + size >= len(text):
+                break
+        return out
+
+    print("📄 Normalizing new documents (including Excel if present)...")
+
+    for doc in new_docs:
+        # Figure out filename / extension
+        file_name = doc.get("source") or doc.get("title") or doc.get("file_name") or "document"
+        file_ext = (doc.get("ext") or "").lower()
+
+        # Heuristic to detect Excel supporting docs (same as build_faiss_index)
+        is_excel = (
+            file_ext in (".xlsx", ".xls")
+            or str(file_name).lower().endswith((".xlsx", ".xls"))
+            or doc.get("file_bytes")
+            or doc.get("content_bytes")
+            or (doc.get("file_path") and str(doc.get("file_path")).lower().endswith((".xlsx", ".xls")))
+        )
+
+        # === Excel path ======================================================
+        if is_excel:
+            print(f"📊 Detected Excel document for append: {file_name}")
+
+            # If upload already split it into per-sheet entries (type == 'excel_sheet'),
+            # or we only have workbook bytes, _process_excel_doc_to_chunks handles both.
+            excel_chunks = _process_excel_doc_to_chunks(doc)
+
+            if not excel_chunks:
+                # Fallback: if there's plain text, at least index that instead of skipping
+                doc_text = doc.get("text", "")
+                if doc_text and doc_text.strip():
+                    # Prefer chunk_document_safe if available
+                    try:
+                        from utils import chunk_document_safe
+                        doc_chunks = chunk_document_safe(doc_text, max_tokens=7500)
+                    except Exception:
+                        doc_chunks = _sliding_window_text_simple(doc_text)
+
+                    for i, piece in enumerate(doc_chunks):
+                        if not piece.strip():
+                            continue
+                        new_texts.append(piece)
+                        new_metadata.append({
+                            "type": doc.get("type", "document"),
+                            "title": f"{file_name} (Part {i+1}/{len(doc_chunks)})",
+                            "source": file_name,
+                            "sheet": None,
+                            "text": piece,
+                            "chunk_id": i
+                        })
+                else:
+                    print(f"⚠️ Skipping Excel doc with no readable content: {file_name}")
+                continue  # done with this doc
+
+            # Normal Excel handling (match build_faiss_index metadata)
+            for c in excel_chunks:
+                txt = c.get("text", "")
+                if not txt or not txt.strip():
+                    continue
+
+                new_texts.append(txt)
+                new_metadata.append({
+                    "type": c.get("type", "support_doc_table"),
+                    "title": c.get("title"),
+                    "file_name": c.get("file_name"),
+                    "source": file_name,
+                    "sheet": c.get("sheet_name") or c.get("sheet"),
+                    "sheet_name": c.get("sheet_name") or c.get("sheet"),
+                    "sheet_rows": c.get("sheet_rows"),
+                    "sheet_cols": c.get("sheet_cols"),
+                    "headers": c.get("headers"),
+                    "text": txt,
+                    "chunk_id": c.get("chunk_id"),
+                    # keep CSV bytes so that the exact sheet can be reconstructed later
+                    "sheet_csv_bytes": c.get("sheet_csv_bytes")
+                })
+
+            continue  # move on to next doc
+
+        # === Non-Excel documents ============================================
+        doc_text = doc.get("text", "")
+        if not doc_text or not doc_text.strip():
+            print(f"⚠️  Skipping empty document: {file_name}")
+            continue
+
+        # Prefer the same safe chunking strategy as build_faiss_index
+        try:
+            from utils import chunk_document_safe
+            doc_chunks = chunk_document_safe(doc_text, max_tokens=7500)
+        except Exception:
+            doc_chunks = _sliding_window_text_simple(doc_text)
+
+        for i, piece in enumerate(doc_chunks):
+            if not piece.strip():
+                continue
+            new_texts.append(piece)
+            new_metadata.append({
+                "type": doc.get("type", "document"),
+                "title": f"{file_name} (Part {i+1}/{len(doc_chunks)})",
+                "source": file_name,
+                "sheet": None,
+                "text": piece,
+                "chunk_id": i
+            })
+
+    if not new_texts:
+        print("⚠️  No valid text segments to add!")
+        return
+
+    print(f"✅ Prepared {len(new_texts)} new text segments for embedding")
+
+    # Generate embeddings with checkpoint
+    checkpoint_path = None
+    if use_checkpoint:
+        Path(CHECKPOINT_DIR).mkdir(parents=True, exist_ok=True)
+        checkpoint_path = os.path.join(CHECKPOINT_DIR, "append_checkpoint.pkl")
+
+    try:
+        print(f"\n📊 Generating embeddings for {len(new_texts)} new segments...")
+        new_embeddings = _embed_texts_with_retry(new_texts, checkpoint_path=checkpoint_path)
+
+        # Clear checkpoint on success
+        if checkpoint_path:
+            _clear_checkpoint(checkpoint_path)
+
+    except Exception as e:
+        print(f"❌ Failed to generate embeddings for new documents: {e}")
+
+        if checkpoint_path and Path(checkpoint_path).exists():
+            print(f"\n💾 Checkpoint saved at: {checkpoint_path}")
+            print(f"💡 Run the append operation again to resume from checkpoint.")
+
+        raise
+
+    if len(new_embeddings) == 0:
+        print("⚠️  No embeddings generated for new documents!")
+        return
+
+    # Add to index using FAISS
+    print(f"\n➕ Adding {len(new_embeddings)} vectors to existing FAISS index...")
+    index.add(new_embeddings.astype("float32"))
+
+    # Update metadata list in memory
+    metadata.extend(new_metadata)
+
+    # Save updated index
+    faiss.write_index(index, index_path)
+
+    meta_path = index_path.replace(".faiss", ".meta.pkl")
+    with open(meta_path, "wb") as f:
+        pickle.dump(metadata, f)
+
+    print(f"✅ Updated index now has {index.ntotal} vectors")
+    print(f"📝 Metadata entries now: {len(metadata)}")
+
+
 
 with tab1:
     st.header("📁 Source Code Upload & Analysis")
