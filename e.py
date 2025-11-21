@@ -1,4 +1,583 @@
 
+with tab8:
+    st.markdown("""
+    <style>
+        .validator-header {
+            text-align: center;
+            padding: 0.8rem;
+            background: linear-gradient(90deg, #10b981, #14b8a6);
+            color: white;
+            border-radius: 10px;
+            font-size: 1.4rem;
+            font-weight: 600;
+            margin-bottom: 1.2rem;
+        }
+        .validator-box {
+            background-color: #f9fafc;
+            border: 1px solid #e5e7eb;
+            border-radius: 12px;
+            padding: 1.5rem;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.05);
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown('<div class="validator-header">🧾 BRD Validation Assistant</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="validator-box">', unsafe_allow_html=True)
+    uploaded_brd = st.file_uploader("📤 Upload your BRD (Word, PDF, or Text)", type=["docx", "pdf", "txt", "md"])
+    validate_button = st.button("✅ Validate BRD", use_container_width=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    if validate_button and uploaded_brd:
+        from brd_generator import validate_uploaded_brd
+        import docx, tempfile, fitz, io, json
+
+        # --- Extract text from uploaded file ---
+        text = ""
+        if uploaded_brd.name.endswith(".docx"):
+            doc = docx.Document(uploaded_brd)
+            text = "\n".join(p.text for p in doc.paragraphs)
+        elif uploaded_brd.name.endswith(".pdf"):
+            pdf = fitz.open(stream=uploaded_brd.read(), filetype="pdf")
+            text = "\n".join(page.get_text() for page in pdf)
+        else:
+            text = uploaded_brd.read().decode("utf-8", errors="ignore")
+
+        with st.spinner("🔍 Validating entire BRD (this may take a minute)..."):
+            idx, texts, meta, _, _ = load_index(index_path)
+            seed_results = query(idx, texts, meta,
+                                "overview main modules data access business processes controllers",
+                                top_k=15)
+            result = validate_uploaded_brd(text, seed_results)
+
+            # --- Display summary ---
+            if result["status"].lower() == "valid":
+                st.success("✅ BRD aligns with the application context.")
+            else:
+                st.error("❌ BRD has mismatches with the analyzed system.")
+
+            st.markdown(f"**Summary:** {result['summary']}")
+            st.divider()
+
+            # --- Section-wise checks ---
+            # st.subheader("📋 Section Results")
+            # for key, val in result.get("checks", {}).items():
+            #     icon = "✔️" if val.lower() == "pass" else "❌"
+            #     st.write(f"{icon} **{key.replace('_',' ').title()}**")
+            # --- Section-wise checks (dynamic) ---
+            st.subheader("📋 Section Results")
+
+            sections = result.get("sections", {})
+            if not sections:
+                st.info("No section-level results available.")
+            else:
+                for name, info in sections.items():
+                    status = (info.get("status", "") or "").lower()
+                    reason = info.get("reason", "") or ""
+                    icon = "✔️" if status == "pass" else "❌"
+
+                    if status == "pass":
+                        st.write(f"{icon} **{name}** – Passed")
+                    else:
+                        st.write(f"{icon} **{name}** – Failed")
+                        if reason:
+                            st.caption(f"• {reason}")
+
+            # --- Download detailed report ---
+            st.divider()
+            report_json = json.dumps(result, indent=2)
+            st.download_button(
+                label="📥 Download Detailed Validation Report (JSON)",
+                data=report_json,
+                file_name="brd_validation_report.json",
+                mime="application/json",
+                use_container_width=True
+            )
+
+            # --- Word report download ---
+        from brd_generator import generate_brd_validation_docx
+        word_data = generate_brd_validation_docx(result, seed_results)
+
+        st.download_button(
+            label="📘 Download BRD Validation Report (Word)",
+            data=word_data,
+            file_name="brd_validation_report.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True
+        )
+
+
+from utils import chunk_document_safe
+import json, re, time
+from docx import Document
+from docx.shared import Pt, RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+import io
+from datetime import datetime
+
+def validate_uploaded_brd(brd_text: str, seed_results: list) -> dict:
+    """
+    ✅ Enhanced BRD validation with dynamic section detection and detailed failure reasons.
+    Validates uploaded BRD (supports 100+ pages) against repository insights.
+    Uses shared _chat() for Azure GPT-4.1-mini.
+    """
+
+    # --- Context summary (limit safely) ---
+    context_summary = "\n\n".join([r.get("text", "")[:2000] for r in seed_results[:10]])
+
+    # --- Chunk entire BRD (~9k tokens each ≈ 20–25 pages) ---
+    brd_chunks = chunk_document_safe(brd_text, max_tokens=9000)
+    total_chunks = len(brd_chunks)
+    print(f"🧾 Validating BRD ({total_chunks} chunks, full coverage)...")
+
+    all_results = []
+
+    for i, chunk in enumerate(brd_chunks, start=1):
+        prompt = f"""
+You are a senior BRD validator with expertise in software requirements analysis.
+
+Compare this BRD content chunk ({i}/{total_chunks}) with the provided repository context.
+
+**CRITICAL INSTRUCTIONS:**
+1. IDENTIFY all sections present in this chunk (e.g., Executive Summary, Objectives, Scope, 
+   Assumptions, Constraints, Risks, Functional Requirements, Non-Functional Requirements, 
+   User Stories, Use Cases, APIs, Data Models, Security Requirements, etc.)
+   
+2. For EACH section found:
+   - Determine if it ALIGNS with the application context
+   - If it FAILS, provide SPECIFIC, ACTIONABLE reasons explaining:
+     * What information is misaligned or missing
+     * Which specific requirements conflict with the system
+     * What technical gaps exist
+     * Concrete examples of discrepancies
+
+3. Respond ONLY in valid JSON format with this exact structure:
+
+{{
+  "status": "valid" or "invalid",
+  "summary": "Brief 1-2 sentence evaluation of this chunk's alignment",
+  "sections": [
+    {{
+      "name": "Exact section name from BRD",
+      "status": "pass" or "fail",
+      "reason": "Detailed, specific explanation (MANDATORY for fail status). Include concrete examples and technical details.",
+      "confidence": "high" or "medium" or "low"
+    }}
+  ],
+  "detected_sections_count": <number of sections identified>,
+  "critical_issues": ["List of critical misalignments if any"]
+}}
+
+**VALIDATION RULES:**
+- Only include sections that ACTUALLY appear in this chunk
+- For PASS: Confirm alignment with specific details
+- For FAIL: Provide detailed, actionable reasons with examples
+- Use "confidence" to indicate validation certainty
+- Flag "critical_issues" for major problems (security gaps, conflicting requirements, etc.)
+
+--- REPOSITORY CONTEXT ---
+{context_summary}
+
+--- BRD CHUNK ({i}/{total_chunks}) ---
+{chunk[:8500]}
+
+Remember: Be thorough, specific, and provide actionable feedback for any failures.
+"""
+
+        # --- Retry logic using _chat() ---
+        for attempt in range(3):
+            try:
+                response_text = _chat([
+                    {"role": "system", "content": "You are an enterprise BRD validator. Respond only in valid JSON format."},
+                    {"role": "user", "content": prompt}
+                ], temperature=0.1)
+
+                # Extract JSON from response
+                json_match = re.search(r"\{.*\}", response_text, re.DOTALL)
+                if not json_match:
+                    raise ValueError("No JSON object found in model output")
+
+                parsed = json.loads(json_match.group(0))
+
+                # Normalize structure
+                if "sections" not in parsed or not isinstance(parsed["sections"], list):
+                    parsed["sections"] = []
+                if "critical_issues" not in parsed:
+                    parsed["critical_issues"] = []
+                if "detected_sections_count" not in parsed:
+                    parsed["detected_sections_count"] = len(parsed["sections"])
+
+                parsed["chunk_id"] = i
+                all_results.append(parsed)
+                print(f"✓ Chunk {i}/{total_chunks} validated ({parsed['detected_sections_count']} sections found)")
+                break
+                
+            except Exception as e:
+                print(f"⚠️ Chunk {i}/{total_chunks} failed (attempt {attempt+1}): {e}")
+                time.sleep(2 + attempt)
+                if attempt == 2:
+                    # Fallback entry when the model fails 3 times
+                    all_results.append({
+                        "chunk_id": i,
+                        "status": "invalid",
+                        "summary": f"Chunk {i} failed validation due to model or parsing errors after 3 attempts.",
+                        "sections": [{
+                            "name": "Validation Error",
+                            "status": "fail",
+                            "reason": f"Technical error during validation: {str(e)}. Unable to process this section of the BRD.",
+                            "confidence": "low"
+                        }],
+                        "detected_sections_count": 0,
+                        "critical_issues": ["Validation process failure"]
+                    })
+
+    if not all_results:
+        return {
+            "status": "invalid",
+            "summary": "No valid responses from validation model.",
+            "sections": {},
+            "chunks": [],
+            "critical_issues": ["Complete validation failure"]
+        }
+
+    # --- Aggregate Results with Enhanced Tracking ---
+    section_stats = {}
+    valid_count = 0
+    invalid_count = 0
+    all_critical_issues = []
+
+    for r in all_results:
+        # Track chunk-level status
+        if r.get("status", "invalid").lower() == "valid":
+            valid_count += 1
+        else:
+            invalid_count += 1
+
+        # Collect critical issues
+        critical = r.get("critical_issues", [])
+        if critical:
+            all_critical_issues.extend(critical)
+
+        # Aggregate section-level results
+        for sec in r.get("sections", []):
+            name = (sec.get("name") or "").strip()
+            if not name:
+                continue
+                
+            status = (sec.get("status") or "fail").lower()
+            reason = (sec.get("reason") or "").strip()
+            confidence = sec.get("confidence", "medium")
+
+            if name not in section_stats:
+                section_stats[name] = {
+                    "pass": 0,
+                    "fail": 0,
+                    "fail_reasons": [],
+                    "pass_confirmations": [],
+                    "confidence_scores": []
+                }
+
+            section_stats[name]["confidence_scores"].append(confidence)
+            
+            if status == "pass":
+                section_stats[name]["pass"] += 1
+                if reason:
+                    section_stats[name]["pass_confirmations"].append(reason)
+            else:
+                section_stats[name]["fail"] += 1
+                if reason:
+                    section_stats[name]["fail_reasons"].append(reason)
+
+    # --- Build Final Aggregated Sections with Detailed Reasons ---
+    aggregated_sections = {}
+    for name, stats in section_stats.items():
+        is_pass = stats["pass"] >= stats["fail"]
+        status = "pass" if is_pass else "fail"
+
+        # Determine confidence
+        confidence_map = {"high": 3, "medium": 2, "low": 1}
+        avg_confidence_score = sum(confidence_map.get(c, 2) for c in stats["confidence_scores"]) / len(stats["confidence_scores"])
+        if avg_confidence_score >= 2.5:
+            confidence = "high"
+        elif avg_confidence_score >= 1.5:
+            confidence = "medium"
+        else:
+            confidence = "low"
+
+        # Build detailed reason
+        reason = ""
+        if status == "fail":
+            # Deduplicate and format failure reasons
+            unique_reasons = list(dict.fromkeys(stats["fail_reasons"]))
+            if unique_reasons:
+                reason = " | ".join(unique_reasons[:5])  # Show up to 5 distinct reasons
+            else:
+                reason = "Multiple alignment issues detected across chunks. Review detailed chunk analysis for specifics."
+        else:
+            # For passing sections, optionally include confirmation
+            if stats["pass_confirmations"]:
+                reason = stats["pass_confirmations"][0]  # Use first confirmation as summary
+
+        aggregated_sections[name] = {
+            "status": status,
+            "reason": reason,
+            "confidence": confidence,
+            "pass_count": stats["pass"],
+            "fail_count": stats["fail"]
+        }
+
+    # --- Overall Status and Summary ---
+    overall_status = "valid" if valid_count >= invalid_count else "invalid"
+    total_sections = len(aggregated_sections)
+    failed_sections = sum(1 for s in aggregated_sections.values() if s["status"] == "fail")
+    
+    summary = (
+        f"Validated {total_chunks} chunks covering {total_sections} distinct sections. "
+        f"{valid_count} chunks passed, {invalid_count} failed. "
+        f"{failed_sections} sections require attention."
+    )
+
+    # Add critical issues to summary if any
+    if all_critical_issues:
+        unique_critical = list(dict.fromkeys(all_critical_issues))[:3]
+        summary += f" Critical issues: {', '.join(unique_critical)}"
+
+    aggregated = {
+        "status": overall_status,
+        "summary": summary,
+        "sections": aggregated_sections,
+        "chunks": all_results,
+        "critical_issues": list(dict.fromkeys(all_critical_issues)),
+        "statistics": {
+            "total_chunks": total_chunks,
+            "valid_chunks": valid_count,
+            "invalid_chunks": invalid_count,
+            "total_sections": total_sections,
+            "passed_sections": total_sections - failed_sections,
+            "failed_sections": failed_sections
+        }
+    }
+
+    print(f"✅ BRD Validation Completed: {total_sections} sections across {total_chunks} chunks")
+    return aggregated
+
+
+def generate_brd_validation_docx(result: dict, seed_results: list) -> bytes:
+    """
+    📄 Generate an enhanced, professional Word report (.docx) for BRD validation.
+    Includes dynamic checklist, detailed failure reasons, and visual formatting.
+    Returns raw bytes ready for Streamlit download.
+    """
+
+    doc = Document()
+
+    # --- Cover Page ---
+    title = doc.add_heading("BRD Validation Report", level=0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    for run in title.runs:
+        run.font.color.rgb = RGBColor(16, 185, 129)  # Green color
+
+    doc.add_paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", style="Body Text").alignment = WD_ALIGN_PARAGRAPH.CENTER
+    doc.add_paragraph("Validated using Azure GPT-4.1-mini against repository insights", style="Body Text").alignment = WD_ALIGN_PARAGRAPH.CENTER
+    doc.add_paragraph()
+
+    # --- Executive Summary ---
+    doc.add_heading("📊 Executive Summary", level=1)
+    
+    status = (result.get("status", "unknown") or "").upper()
+    status_text = "✅ VALID" if status == "VALID" else "❌ INVALID"
+    status_para = doc.add_paragraph()
+    status_run = status_para.add_run(f"Overall Validation Status: {status_text}")
+    status_run.bold = True
+    status_run.font.size = Pt(12)
+    if status == "VALID":
+        status_run.font.color.rgb = RGBColor(16, 185, 129)
+    else:
+        status_run.font.color.rgb = RGBColor(239, 68, 68)
+
+    doc.add_paragraph(result.get("summary", "No summary available."))
+
+    # Statistics
+    stats = result.get("statistics", {})
+    if stats:
+        doc.add_paragraph()
+        doc.add_paragraph("📈 Validation Statistics:", style="Heading 3")
+        doc.add_paragraph(f"• Total Chunks Analyzed: {stats.get('total_chunks', 0)}")
+        doc.add_paragraph(f"• Valid Chunks: {stats.get('valid_chunks', 0)}")
+        doc.add_paragraph(f"• Invalid Chunks: {stats.get('invalid_chunks', 0)}")
+        doc.add_paragraph(f"• Total Sections Found: {stats.get('total_sections', 0)}")
+        doc.add_paragraph(f"• Passed Sections: {stats.get('passed_sections', 0)}")
+        doc.add_paragraph(f"• Failed Sections: {stats.get('failed_sections', 0)}")
+
+    # Critical Issues
+    critical_issues = result.get("critical_issues", [])
+    if critical_issues:
+        doc.add_paragraph()
+        doc.add_heading("⚠️ Critical Issues", level=2)
+        for issue in critical_issues[:10]:  # Limit to 10
+            p = doc.add_paragraph(issue, style="List Bullet")
+            for run in p.runs:
+                run.font.color.rgb = RGBColor(239, 68, 68)
+
+    doc.add_page_break()
+
+    # --- Dynamic Section Checklist ---
+    doc.add_heading("✅ BRD Section Validation Checklist", level=1)
+    doc.add_paragraph("This checklist is dynamically generated based on sections detected in your BRD.")
+
+    sections = result.get("sections", {})
+    if sections:
+        # Create table with headers
+        table = doc.add_table(rows=1, cols=5)
+        table.style = 'Light Grid Accent 1'
+        
+        hdr_cells = table.rows[0].cells
+        hdr_cells[0].text = "Section Name"
+        hdr_cells[1].text = "Status"
+        hdr_cells[2].text = "Confidence"
+        hdr_cells[3].text = "Occurrences"
+        hdr_cells[4].text = "Validation Details / Reason"
+
+        # Make headers bold
+        for cell in hdr_cells:
+            for paragraph in cell.paragraphs:
+                for run in paragraph.runs:
+                    run.bold = True
+
+        # Add section data
+        for name, info in sorted(sections.items()):
+            row_cells = table.add_row().cells
+            
+            # Section name
+            row_cells[0].text = name
+            
+            # Status with icon
+            status_val = (info.get("status", "") or "").lower()
+            status_text = "✅ Pass" if status_val == "pass" else "❌ Fail"
+            row_cells[1].text = status_text
+            
+            # Confidence
+            confidence = info.get("confidence", "medium")
+            row_cells[2].text = confidence.capitalize()
+            
+            # Occurrences
+            pass_count = info.get("pass_count", 0)
+            fail_count = info.get("fail_count", 0)
+            row_cells[3].text = f"✓{pass_count} / ✗{fail_count}"
+            
+            # Reason/Details
+            reason = info.get("reason", "") or "No specific details provided."
+            row_cells[4].text = reason
+            
+            # Color coding for failed sections
+            if status_val == "fail":
+                for paragraph in row_cells[1].paragraphs:
+                    for run in paragraph.runs:
+                        run.font.color.rgb = RGBColor(239, 68, 68)
+
+        # Summary after table
+        doc.add_paragraph()
+        passed = sum(1 for s in sections.values() if s.get("status") == "pass")
+        failed = sum(1 for s in sections.values() if s.get("status") == "fail")
+        doc.add_paragraph(f"Summary: {passed} sections passed, {failed} sections failed out of {len(sections)} total sections detected.")
+        
+    else:
+        doc.add_paragraph("⚠️ No sections were detected in the uploaded BRD. Please verify the document format.")
+
+    doc.add_page_break()
+
+    # --- Repository Context Reference ---
+    doc.add_heading("📚 Repository Context Summary", level=1)
+    doc.add_paragraph("The following repository insights were used as validation baseline:")
+    
+    for i, r in enumerate(seed_results[:8], start=1):
+        snippet = (r.get("text", "") or "").strip().replace("\n", " ")
+        if snippet:
+            doc.add_paragraph(f"{i}. {snippet[:600]}{'...' if len(snippet) > 600 else ''}", style="List Number")
+
+    doc.add_page_break()
+
+    # --- Detailed Chunk Analysis ---
+    doc.add_heading("🔍 Detailed Chunk-Level Analysis", level=1)
+    doc.add_paragraph("Below is a detailed breakdown of validation results for each document chunk:")
+
+    for chunk in result.get("chunks", []):
+        chunk_id = chunk.get("chunk_id", "?")
+        chunk_status = chunk.get("status", "unknown")
+        
+        # Chunk header
+        heading = doc.add_heading(f"Chunk {chunk_id} - {chunk_status.upper()}", level=2)
+        if chunk_status.lower() == "invalid":
+            for run in heading.runs:
+                run.font.color.rgb = RGBColor(239, 68, 68)
+        
+        doc.add_paragraph(chunk.get("summary", "No summary available."))
+        
+        sections_in_chunk = chunk.get("sections", [])
+        detected_count = chunk.get("detected_sections_count", len(sections_in_chunk))
+        doc.add_paragraph(f"Sections detected in this chunk: {detected_count}")
+
+        if sections_in_chunk:
+            # Create mini-table for chunk sections
+            chunk_table = doc.add_table(rows=1, cols=4)
+            chunk_table.style = 'Light List Accent 1'
+            
+            hdr = chunk_table.rows[0].cells
+            hdr[0].text = "Section"
+            hdr[1].text = "Status"
+            hdr[2].text = "Confidence"
+            hdr[3].text = "Details / Reason"
+
+            for sec in sections_in_chunk:
+                name = sec.get("name", "Unknown")
+                status_val = (sec.get("status", "") or "").lower()
+                reason = sec.get("reason", "No details provided.")
+                confidence = sec.get("confidence", "medium")
+                
+                row = chunk_table.add_row().cells
+                row[0].text = name
+                row[1].text = "✅ Pass" if status_val == "pass" else "❌ Fail"
+                row[2].text = confidence.capitalize()
+                row[3].text = reason
+        else:
+            doc.add_paragraph("⚠️ No sections identified in this chunk.")
+
+        # Critical issues for this chunk
+        chunk_critical = chunk.get("critical_issues", [])
+        if chunk_critical:
+            doc.add_paragraph("🚨 Critical Issues in This Chunk:", style="Heading 4")
+            for issue in chunk_critical:
+                p = doc.add_paragraph(issue, style="List Bullet")
+                for run in p.runs:
+                    run.font.color.rgb = RGBColor(239, 68, 68)
+
+        doc.add_paragraph()  # Spacing
+
+    # --- Footer ---
+    doc.add_paragraph()
+    footer = doc.add_paragraph("━" * 60)
+    footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    
+    footer_text = doc.add_paragraph(
+        "Powered by Azure GPT-4.1-mini + Enhanced Validation Engine | "
+        "Generated by BRD Validation Assistant"
+    )
+    footer_text.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    for run in footer_text.runs:
+        run.font.size = Pt(9)
+        run.font.color.rgb = RGBColor(107, 114, 128)
+
+    # --- Save to BytesIO ---
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+
+
+
 def add_documents_to_index(
     index_path: str,
     new_docs: List[Dict[str, Any]],
